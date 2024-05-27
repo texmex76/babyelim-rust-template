@@ -96,6 +96,7 @@ struct Config {
     no_write: bool,
     size_limit: usize,
     occurrence_limit: usize,
+    bound_limit: usize,
 }
 
 fn average(a: usize, b: usize) -> f64 {
@@ -299,6 +300,7 @@ struct CNFFormula {
     values: Values,
     units: Vec<i32>,
     simplified: Vec<i32>,
+    propagated: usize,
 }
 
 impl CNFFormula {
@@ -313,6 +315,7 @@ impl CNFFormula {
             values: Values::new(),
             units: Vec::new(),
             simplified: Vec::new(),
+            propagated: 0,
         }
     }
 
@@ -455,15 +458,14 @@ fn trace_deleted(ctx: &SATContext, clause: &Vec<i32>) {
     // TODO:
 }
 
-fn propagate(ctx: &mut SATContext) {
+fn propagate(ctx: &mut SATContext, flush_units: bool) {
     if ctx.formula.found_empty_clause {
         return;
     }
-    let mut propagated = 0;
-    while propagated != ctx.formula.units.len() {
-        let lit = ctx.formula.units[propagated];
+    while ctx.formula.propagated != ctx.formula.units.len() {
+        let lit = ctx.formula.units[ctx.formula.propagated];
         LOG!(formula.config.verbosity, "propagating literal {}", lit);
-        propagated += 1;
+        ctx.formula.propagated += 1;
         assert!(ctx.formula.values[lit] == 1);
 
         // Shrink clauses with `-lit`
@@ -478,40 +480,35 @@ fn propagate(ctx: &mut SATContext) {
             LOG!(ctx.config.verbosity, "shrinking {:.?}", clause_ref.borrow());
             let new_size = clause_ref.borrow().literals.len() - 1;
             assert!(new_size == ctx.formula.simplified.len());
-            if new_size == 0 {
-                LOG!(
-                    ctx.config.verbosity,
-                    "conflicting {:.?}",
-                    clause_ref.borrow()
-                );
-                ctx.formula.found_empty_clause = true;
-            }
             trace_added(&ctx);
-            if new_size == 0 {
-                return;
-            }
             trace_deleted(&ctx, &clause_ref.borrow().literals);
             clause_ref.borrow_mut().literals = ctx.formula.simplified.clone();
             LOG!(ctx.config.verbosity, "shrank to {:.?}", clause_ref.borrow());
-            let unit = ctx.formula.simplified[0];
-            let value = ctx.formula.values[unit];
-            if value > 0 {
-                continue;
+            if new_size == 0 {
+                if !ctx.formula.found_empty_clause {
+                    verbose!(ctx.config.verbosity, 2, "found empty clause");
+                    ctx.formula.found_empty_clause = true;
+                }
+            } else if new_size == 1 {
+                let unit = ctx.formula.simplified[0];
+                let value = ctx.formula.values[unit];
+                if value == 0 {
+                    ctx.formula.assign(unit);
+                }
             }
-            if value < 0 {
-                LOG!(
-                    ctx.config.verbosity,
-                    "conflicting clause after shrinking {:.?}",
-                    clause_ref.borrow()
-                );
-                ctx.formula.found_empty_clause = true;
-                return;
-            }
-            assert!(unit != 0);
         }
         ctx.formula.matrix[-lit].clear();
 
-        // TODO Disconnect, dequeue, trace and delete satisfied clauses by 'lit'.
+        // TODO Disconnect, dequeue, trace and delete satisfied clauses by 'lit'
+        // but during parsing skip (at least one) unit clause with 'lit'.  Those
+        // will need to be flushed later (in 'flush_unit_clauses').
+
+        if !flush_units {
+            // TODO you could already flush all but on unit clause.
+
+            continue;
+        }
+
         for clause_ref in ctx.formula.matrix[lit].clone() {
 
             // TODO disconnect 'c' from 'matrix'.
@@ -521,6 +518,28 @@ fn propagate(ctx: &mut SATContext) {
             // TODO trace deletion and delete 'c'.
         }
         ctx.formula.matrix[lit].clear();
+    }
+}
+
+fn flush_unit_clauses(ctx: &mut SATContext) {
+    verbose!(
+        ctx.config.verbosity,
+        1,
+        "flushing {} unit clauses",
+        ctx.formula.units.len()
+    );
+    for &unit in &ctx.formula.units {
+        assert!(ctx.formula.matrix[-unit].is_empty());
+        // TODO add back 'assert(matrix[unit].size() == 1);'
+        for clause_ref in ctx.formula.matrix[unit].clone() {
+
+            // TODO disconnect 'c' from 'matrix'.
+
+            // TODO dequeue 'c' from 'clauses'.
+
+            // TODO trace deletion and delete 'c'.
+        }
+        ctx.formula.matrix[unit].clear();
     }
 }
 
@@ -601,34 +620,55 @@ fn parse_cnf(input_path: String, ctx: &mut SATContext) -> io::Result<()> {
                     trace_added(ctx);
                     trace_deleted(ctx, &clause);
                 }
-                match simplified_clause.len() {
-                    0 => {
-                        if !ctx.formula.found_empty_clause {
-                            verbose!(ctx.config.verbosity, 2, "found empty clause");
-                            ctx.formula.found_empty_clause = true;
-                        }
+                let new_clause = Rc::new(RefCell::new(Clause {
+                    id: ctx.stats.added,
+                    literals: ctx.formula.simplified.clone(),
+                }));
+                ctx.formula
+                    .connect_clause(new_clause.clone(), ctx.config.verbosity);
+                ctx.formula.clauses.push_back(new_clause.clone());
+                if new_clause.borrow().literals.is_empty() {
+                    if !ctx.formula.found_empty_clause {
+                        verbose!(ctx.config.verbosity, 2, "found empty clause");
+                        ctx.formula.found_empty_clause = true;
                     }
-                    1 => {
-                        LOG!(ctx.config.verbosity, "unit clause: {:?}", simplified_clause);
-                        ctx.formula.assign(simplified_clause[0]);
-                        propagate(ctx);
-                    }
-                    _ => {
-                        let new_clause = Rc::new(RefCell::new(Clause {
-                            id: ctx.stats.added,
-                            literals: ctx.formula.simplified.clone(),
-                        }));
-                        ctx.formula
-                            .connect_clause(new_clause.clone(), ctx.config.verbosity);
-                        ctx.formula.clauses.push_back(new_clause);
-                        ctx.stats.added += 1;
-                    }
+                } else if new_clause.borrow().literals.len() == 1 {
+                    let unit = new_clause.borrow().literals[0];
+                    LOG!(ctx.config.verbosity, "unit clause: {:?}", unit);
+                    ctx.formula.assign(unit);
+                    propagate(ctx, false); // Propagate but delay flushing
                 }
+            } else {
+                trace_deleted(ctx, &clause);
             }
+            // match simplified_clause.len() {
+            //     0 => {
+            //         if !ctx.formula.found_empty_clause {
+            //             verbose!(ctx.config.verbosity, 2, "found empty clause");
+            //             ctx.formula.found_empty_clause = true;
+            //         }
+            //     }
+            //     1 => {
+            //         LOG!(ctx.config.verbosity, "unit clause: {:?}", simplified_clause);
+            //         ctx.formula.assign(simplified_clause[0]);
+            //         propagate(ctx, false);
+            //     }
+            //     _ => {
+            //         let new_clause = Rc::new(RefCell::new(Clause {
+            //             id: ctx.stats.added,
+            //             literals: ctx.formula.simplified.clone(),
+            //         }));
+            //         ctx.formula
+            //             .connect_clause(new_clause.clone(), ctx.config.verbosity);
+            //         ctx.formula.clauses.push_back(new_clause);
+            //         ctx.stats.added += 1;
+            //     }
+            // }
         } else {
             parse_error!(ctx, "CNF header not found.", line_number);
         }
     }
+    flush_unit_clauses(ctx);
     verbose!(
         ctx.config.verbosity,
         1,
@@ -674,7 +714,7 @@ fn can_eliminate_variable(ctx: &SATContext, pivot: i32) -> bool {
     if size_or_occurrence_limit_exceeded(ctx, -pivot) {
         return false;
     }
-    let limit = pos + neg;
+    let limit = pos + neg + ctx.config.bound_limit;
     LOG!(
         ctx.config.verbosity,
         "trying to eliminate variable {} with {} occurrences",
@@ -764,33 +804,35 @@ fn eliminate(ctx: &mut SATContext) {
             if ctx.formula.found_empty_clause {
                 break;
             }
-            if can_eliminate_variable(ctx, pivot as i32) {
-                add_all_resolvents(ctx, pivot as i32);
-                remove_all_clauses_with_variable(ctx, pivot as i32);
-                ctx.formula.elimenated[pivot] = true;
-                ctx.stats.eliminated += 1;
-                propagate(ctx);
+            if !can_eliminate_variable(ctx, pivot as i32) {
+                continue;
             }
-            let after = ctx.stats.eliminated;
-            if before == after {
-                verbose!(
-                    ctx.config.verbosity,
-                    1,
-                    "unsuccesful variable elimination round {}",
-                    ctx.stats.rounds
-                );
-                break;
-            }
-            let delta = after - before;
+            add_all_resolvents(ctx, pivot as i32);
+            ctx.formula.elimenated[pivot] = true;
+            remove_all_clauses_with_variable(ctx, pivot as i32);
+            ctx.stats.eliminated += 1;
+            propagate(ctx, true);
+        }
+
+        let after = ctx.stats.eliminated;
+        if before == after {
             verbose!(
                 ctx.config.verbosity,
                 1,
-                "eliminated {} variables {} in round {}",
-                delta,
-                percent(delta, ctx.formula.variables),
+                "unsuccesful variable elimination round {}",
                 ctx.stats.rounds
             );
+            break;
         }
+        let delta = after - before;
+        verbose!(
+            ctx.config.verbosity,
+            1,
+            "eliminated {} variables {} in round {}",
+            delta,
+            percent(delta, ctx.formula.variables),
+            ctx.stats.rounds
+        );
     }
     message!(
         ctx.config.verbosity,
@@ -837,7 +879,20 @@ fn print(ctx: &SATContext) {
     );
 
     if ctx.formula.found_empty_clause {
-        writeln!(output, "p cnf {} 0", ctx.formula.variables).expect("Failed to write CNF header");
+        if !ctx.config.proof_path.is_empty() {
+            let mut skipped_first_empty_clause = false;
+            for clause in &ctx.formula.clauses {
+                if clause.borrow().literals.len() > 0 {
+                    trace_deleted(ctx, &clause.borrow().literals);
+                } else if skipped_first_empty_clause {
+                    trace_deleted(ctx, &clause.borrow().literals);
+                } else {
+                    skipped_first_empty_clause = true;
+                }
+            }
+            assert!(skipped_first_empty_clause);
+        }
+        writeln!(output, "p cnf {} 0", ctx.formula.variables,).expect("Failed to write CNF header");
     } else {
         writeln!(
             output,
@@ -870,16 +925,16 @@ fn print(ctx: &SATContext) {
 }
 
 fn report(ctx: &SATContext) {
+    assert!(ctx.stats.added >= ctx.stats.deleted);
     let elapsed_time = ctx.stats.start_time.elapsed().as_secs_f64();
-    let propagated_units = ctx.formula.units.len();
     let simplified_clauses = ctx.stats.parsed - ctx.stats.added + ctx.stats.deleted;
 
     message!(
         ctx.config.verbosity,
         "{:<20} {:>10}    {:.2}% variables",
         "propagated-units:",
-        propagated_units,
-        percent(propagated_units, ctx.formula.variables)
+        ctx.formula.propagated,
+        percent(ctx.formula.propagated, ctx.formula.variables)
     );
     message!(
         ctx.config.verbosity,
@@ -944,7 +999,7 @@ fn occurrences(ctx: &SATContext, lit: i32) -> usize {
 }
 
 fn parse_arguments() -> Config {
-    let app = Command::new("BabySub")
+    let app = Command::new("BabyElim")
         .version("1.0")
         .author("Bernhard Gstrein")
         .about("Processes and simplifies logical formulae in DIMACS CNF format.")
@@ -954,13 +1009,13 @@ fn parse_arguments() -> Config {
                 .index(1),
         )
         .arg(
-            Arg::new("output")
-                .help("Sets the output file to use")
+            Arg::new("proof")
+                .help("Sets the proof file to use")
                 .index(2),
         )
         .arg(
-            Arg::new("proof")
-                .help("Sets the proof file to use")
+            Arg::new("output")
+                .help("Sets the output file to use")
                 .index(3),
         )
         .arg(
@@ -983,7 +1038,19 @@ fn parse_arguments() -> Config {
                 .default_value("10000")
                 .help("Set the occurrence limit"),
         )
+        .arg(
+            Arg::new("bound-limit")
+                .short('b')
+                .value_parser(value_parser!(usize))
+                .default_value("0")
+                .help("Bount on number of added clauses per elimination"),
+        )
         .arg(Arg::new("quiet").short('q').help("Suppresses all output"))
+        .arg(
+            Arg::new("force-proof-writing")
+                .short('f')
+                .help("Force proof writing"),
+        )
         .arg(Arg::new("no-output").short('n').help("Do not write output"));
     #[cfg(feature = "logging")]
     let app = app.arg(
@@ -1011,14 +1078,28 @@ fn parse_arguments() -> Config {
         *matches.get_one::<u8>("verbosity").unwrap_or(&0) as i32
     };
 
+    let force_proof_writing = matches.is_present("force-proof-writing");
+    let proof_path = matches.value_of("proof").unwrap_or("").to_string();
+    let path = Path::new(&proof_path);
+    if path.exists()
+        && !force_proof_writing
+        && (path.extension().unwrap() == "cnf"
+            || path.extension().unwrap() == "cnf.bz2"
+            || path.extension().unwrap() == "cnf.gz"
+            || path.extension().unwrap() == "cnf.xz")
+    {
+        die!("Proof file already exists: '{}'", proof_path);
+    }
+
     Config {
         input_path: matches.value_of("input").unwrap_or("<stdin>").to_string(),
         output_path: matches.value_of("output").unwrap_or("<stdout>").to_string(),
-        proof_path: matches.value_of("proof").unwrap_or("").to_string(),
+        proof_path,
         verbosity,
         no_write: matches.is_present("no-output"),
         size_limit: *matches.get_one("size-limit").unwrap(),
         occurrence_limit: *matches.get_one("occurrence-limit").unwrap(),
+        bound_limit: *matches.get_one("bound-limit").unwrap(),
     }
 }
 
